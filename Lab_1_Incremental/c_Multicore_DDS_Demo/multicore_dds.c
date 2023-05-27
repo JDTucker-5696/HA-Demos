@@ -44,10 +44,10 @@ typedef signed int fix15 ;
 #define Fs 40000
 // the DDS units - core 1
 volatile unsigned int phase_accum_main_1;
-volatile unsigned int phase_incr_main_1 = (800.0*two32)/Fs ;
+volatile unsigned int phase_incr_main_1 = (2360.0*two32)/Fs ;
 // the DDS units - core 2
 volatile unsigned int phase_accum_main_0;
-volatile unsigned int phase_incr_main_0 = (400.0*two32)/Fs ;
+volatile unsigned int phase_incr_main_0 = (2240.0*two32)/Fs ;
 
 // DDS sine table
 #define sine_table_size 256
@@ -66,7 +66,7 @@ fix15 current_amplitude_1 = 0 ;
 #define ATTACK_TIME             200
 #define DECAY_TIME              200
 #define SUSTAIN_TIME            10000
-#define BEEP_DURATION           10400
+#define BEEP_DURATION           (ATTACK_TIME + SUSTAIN_TIME + DECAY_TIME)
 #define BEEP_REPEAT_INTERVAL    40000
 
 //SPI data
