@@ -2,6 +2,7 @@
     "cortex-debug.registerUseNaturalFormat": false,
     "cortex-debug.variableUseNaturalFormat": false,
     "files.associations": {
-        "vga_graphics.h": "c"
+        "vga_graphics.h": "c",
+        "spi.h": "c"
     }
 }

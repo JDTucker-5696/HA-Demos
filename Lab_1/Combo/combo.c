@@ -38,6 +38,7 @@
 #include "hardware/dma.h"
 #include "hardware/adc.h"
 #include "hardware/irq.h"
+#include "hardware/spi.h"   /* for Chirp */
 // Include protothreads
 #include "pt_cornell_rp2040_v1.h"
 
@@ -53,6 +54,196 @@ typedef signed int fix15 ;
 #define int2fix15(a) ((fix15)(a << 15))
 #define fix2int15(a) ((int)(a >> 15))
 #define char2fix15(a) (fix15)(((fix15)(a)) << 15)
+#define divfix(a,b) (fix15)( (((signed long long)(a)) << 15) / (b))
+
+//Direct Digital Synthesis (DDS) parameters
+#define two32 4294967296.0  // 2^32 (a constant)
+#define DDS_Fs 40000            // sample rate
+
+/* vvvvv This is code lifted from Lib_1/Audio_Beep_Synthesis.
+            for Chirp                            vvvvvvvvvvv */
+
+// the DDS units - core 0
+// Phase accumulator and phase increment. Increment sets output frequency.
+volatile unsigned int phase_accum_main_L;
+volatile unsigned int phase_incr_main_L = (2200.0*two32)/DDS_Fs ;
+// the DDS units - core 1
+// Phase accumulator and phase increment. Increment sets output frequency.
+volatile unsigned int phase_accum_main_R;                  
+volatile unsigned int phase_incr_main_R = (2400.0*two32)/DDS_Fs ;
+
+// DDS sine table (populated in main())
+#define sine_table_size 256
+fix15 sin_table[sine_table_size] ;
+
+// Values output to DAC
+int DAC_output_L ;
+int DAC_output_R ;
+
+// Amplitude modulation parameters and variables
+fix15 max_amplitude = int2fix15(1) ;    // maximum amplitude
+fix15 attack_inc ;                      // rate at which sound ramps up
+fix15 decay_inc ;                       // rate at which sound ramps down
+fix15 current_amplitude_L = 0 ;         // current amplitude (modified in ISR)
+fix15 current_amplitude_R = 0 ;         // current amplitude (modified in ISR)
+
+// Timing parameters for beeps (units of interrupts)
+#define ATTACK_TIME             500
+#define DECAY_TIME              500
+#define SUSTAIN_TIME            10000
+#define BEEP_DURATION           (ATTACK_TIME + SUSTAIN_TIME + DECAY_TIME)
+#define BEEP_REPEAT_INTERVAL    40000
+
+// State machine variables
+volatile unsigned int STATE_L = 0 ;
+volatile unsigned int count_L = 0 ;
+volatile unsigned int STATE_R = 0 ;
+volatile unsigned int count_R = 0 ;
+
+// SPI data
+uint16_t DAC_data_L ; // output value
+uint16_t DAC_data_R ; // output value
+
+// DAC parameters (see the DAC datasheet)
+// A-channel, 1x, active
+#define DAC_config_chan_A 0b0011000000000000
+// B-channel, 1x, active
+#define DAC_config_chan_B 0b1011000000000000
+
+//SPI configurations (note these represent GPIO number, NOT pin number)
+#define PIN_MISO 4
+#define PIN_CS   5
+#define PIN_SCK  6
+#define PIN_MOSI 7
+#define LDAC     8
+#define SPI_PORT spi0
+
+// This timer ISR is called on core 1
+bool repeating_timer_callback_core_R(struct repeating_timer *t) {
+
+    if (STATE_R == 0) {
+        // DDS phase and sine table lookup
+        phase_accum_main_R += phase_incr_main_R  ;
+        DAC_output_R = fix2int15(multfix15(current_amplitude_R,
+            sin_table[phase_accum_main_R>>24])) + 2048 ;
+
+        // Ramp up amplitude
+        if (count_R < ATTACK_TIME) {
+            current_amplitude_R = (current_amplitude_R + attack_inc) ;
+        }
+        // Ramp down amplitude
+        else if (count_R > BEEP_DURATION - DECAY_TIME) {
+            current_amplitude_R = (current_amplitude_R - decay_inc) ;
+        }
+
+        // Mask with DAC control bits
+        DAC_data_R = (DAC_config_chan_A | (DAC_output_R & 0xffff))  ;
+
+        // SPI write (no spinlock b/c of SPI buffer)
+        spi_write16_blocking(SPI_PORT, &DAC_data_R, 1) ;
+
+        // Increment the counter
+        count_R += 1 ;
+
+        // State transition?
+        if (count_R == BEEP_DURATION) {
+            STATE_R = 1 ;
+            count_R = 0 ;
+        }
+    }
+
+    // State transition?
+    else {
+        count_R += 1 ;
+        if (count_R == BEEP_REPEAT_INTERVAL) {
+            current_amplitude_R = 0 ;
+            STATE_R = 0 ;
+            count_R = 0 ;
+        }
+    }
+
+    return true;
+}
+
+// This timer ISR is also called on core 1
+bool repeating_timer_callback_core_L(struct repeating_timer *t) {
+
+    if (STATE_L == 0) {
+        // DDS phase and sine table lookup
+        phase_accum_main_L += phase_incr_main_L  ;
+        DAC_output_L = fix2int15(multfix15(current_amplitude_L,
+            sin_table[phase_accum_main_L>>24])) + 2048 ;
+
+        // Ramp up amplitude
+        if (count_L < ATTACK_TIME) {
+            current_amplitude_L = (current_amplitude_L + attack_inc) ;
+        }
+        // Ramp down amplitude
+        else if (count_L > BEEP_DURATION - DECAY_TIME) {
+            current_amplitude_L = (current_amplitude_L - decay_inc) ;
+        }
+
+        // Mask with DAC control bits
+        DAC_data_L = (DAC_config_chan_B | (DAC_output_L & 0xffff))  ;
+
+        // SPI write (no spinlock b/c of SPI buffer)
+        spi_write16_blocking(SPI_PORT, &DAC_data_L, 1) ;
+
+        // Increment the counter
+        count_L += 1 ;
+
+        // State transition?
+        if (count_L == BEEP_DURATION) {
+            STATE_L = 1 ;
+            count_L = 0 ;
+        }
+    }
+
+    // State transition?
+    else {
+        count_L += 1 ;
+        if (count_L == BEEP_REPEAT_INTERVAL) {
+            current_amplitude_L = 0 ;
+            STATE_L = 0 ;
+            count_L = 0 ;
+        }
+    }
+
+    return true;
+}
+
+// This is the core 1 entry point. Essentially main() for core 1
+void chirpers() {
+
+    // create an alarm pool on core 1
+    //alarm_pool_t *core1pool ;
+    //core1pool = alarm_pool_create(2, 16) ;
+
+    // Create a repeating timer that calls repeating_timer_callback.
+    struct repeating_timer timer_R;
+
+    // Negative delay so means we will call repeating_timer_callback, and call it
+    // again 25us (40kHz) later regardless of how long the callback took to execute
+    add_repeating_timer_us(-25, 
+                            repeating_timer_callback_core_R,
+                            NULL,
+                            &timer_R);
+
+    // Desynchronize the beeps
+    sleep_ms(500) ;
+
+    // Create a repeating timer that calls 
+    // repeating_timer_callback
+    struct repeating_timer timer_L;
+
+    // Negative delay so means we will call repeating_timer_callback, and call it
+    // again 25us (40kHz) later regardless of how long the callback took to execute
+    add_repeating_timer_us(-25,
+                           repeating_timer_callback_core_L,
+                           NULL,
+                           &timer_L);
+
+}
 
 /////////////////////////// ADC configuration ////////////////////////////////
 // ADC Channel and pin
@@ -67,7 +258,7 @@ typedef signed int fix15 ;
 // Log2 number of samples
 #define LOG2_NUM_SAMPLES 10
 // Sample rate (Hz)
-#define Fs 10000.0
+#define ADC_Fs 10000.0
 // ADC clock rate (unmutable!)
 #define ADCCLK 48000000.0
 
@@ -92,6 +283,7 @@ fix15 fi[NUM_SAMPLES] ;
 fix15 Sinewave[NUM_SAMPLES]; 
 // Hann window table for FFT calculation
 fix15 window[NUM_SAMPLES]; 
+
 
 // Pointer to address of start of sample buffer
 uint8_t * sample_address_pointer = &sample_array[0] ;
@@ -220,7 +412,6 @@ static PT_THREAD (protothread_fft(struct pt *pt))
     // Will be used to write dynamic text to screen
     static char freqtext[40];
 
-
     while(1) {
         // Wait for NUM_SAMPLES samples to be gathered
         // Measure wait time with timer. THIS IS BLOCKING
@@ -258,7 +449,7 @@ static PT_THREAD (protothread_fft(struct pt *pt))
             }
         }
         // Compute max frequency in Hz
-        max_freqency = max_fr_dex * (Fs/NUM_SAMPLES) ;
+        max_freqency = max_fr_dex * (ADC_Fs/NUM_SAMPLES) ;
 
         // Display on VGA
         fillRect(250, 20, 176, 30, BLACK); // red box
@@ -290,17 +481,11 @@ static PT_THREAD (protothread_blink(struct pt *pt))
     PT_END(pt) ;
 }
 
-// Core 1 entry point (main() for core 1)
-void core1_entry() {
-    // Add and schedule threads
-    pt_add_thread(protothread_blink) ;
-    pt_schedule_start ;
-}
-
 // Core 0 entry point
 int main() {
     // Initialize stdio
     stdio_init_all();
+    printf("Hello, Combo!\n");
 
     // Initialize the VGA screen
     initVGA() ;
@@ -309,6 +494,39 @@ int main() {
     gpio_init(LED) ;
     gpio_set_dir(LED, GPIO_OUT) ;
     gpio_put(LED, 0) ;
+
+    ///////////////////////////////////////////////////////////////////////////////
+    // ============================== DAC CONFIGURATION ==========================
+    //////////////////////////////////////////////////////////////////////////////
+    // Initialize SPI channel (channel, baud rate set to 20MHz)
+    spi_init(SPI_PORT, 20000000) ;
+    // Format (channel, data bits per transfer, polarity, phase, order)
+    spi_set_format(SPI_PORT, 16, 0, 0, 0);
+
+    // Map SPI signals to GPIO ports
+    gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
+    gpio_set_function(PIN_SCK, GPIO_FUNC_SPI);
+    gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
+    gpio_set_function(PIN_CS, GPIO_FUNC_SPI) ;
+
+    // Map LDAC pin to GPIO port, hold it low (could alternatively tie to GND)
+    gpio_init(LDAC) ;
+    gpio_set_dir(LDAC, GPIO_OUT) ;
+    gpio_put(LDAC, 0) ;
+
+    // set up increments for calculating bow envelope
+    attack_inc = divfix(max_amplitude, int2fix15(ATTACK_TIME)) ;
+    decay_inc =  divfix(max_amplitude, int2fix15(DECAY_TIME)) ;
+
+    // Build the sine lookup table
+    // scaled to produce values between 0 and 4096 (for 12-bit DAC)
+    int ii;
+    for (ii = 0; ii < sine_table_size; ii++){
+         sin_table[ii] = float2fix15(2047*sin((float)ii*6.283/(float)sine_table_size));
+    }
+
+    // Launch Chirpers on core 1
+    multicore_launch_core1(chirpers);
 
     ///////////////////////////////////////////////////////////////////////////////
     // ============================== ADC CONFIGURATION ==========================
@@ -339,14 +557,13 @@ int main() {
     // continuously) or > 95 (take samples less frequently than 96 cycle
     // intervals). This is all timed by the 48 MHz ADC clock. This is setup
     // to grab a sample at 10kHz (48Mhz/10kHz - 1)
-    adc_set_clkdiv(ADCCLK/Fs);
-
+    adc_set_clkdiv(ADCCLK/ADC_Fs);
 
     // Populate the sine table and Hann window table
-    int ii;
-    for (ii = 0; ii < NUM_SAMPLES; ii++) {
-        Sinewave[ii] = float2fix15(sin(6.283 * ((float) ii) / (float)NUM_SAMPLES));
-        window[ii] = float2fix15(0.5 * (1.0 - cos(6.283 * ((float) ii) / ((float)NUM_SAMPLES))));
+    int iii;
+    for (iii = 0; iii < NUM_SAMPLES; iii++) {
+        Sinewave[iii] = float2fix15(sin(6.283 * ((float) iii) / (float)NUM_SAMPLES));
+        window[iii] = float2fix15(0.5 * (1.0 - cos(6.283 * ((float) iii) / ((float)NUM_SAMPLES))));
     }
 
     /////////////////////////////////////////////////////////////////////////////////
@@ -389,11 +606,15 @@ int main() {
         false                               // Don't start immediately.
     );
 
-    // Launch core 1
-    multicore_launch_core1(core1_entry);
 
     // Add and schedule core 0 threads
-    pt_add_thread(protothread_fft) ;
+    //pt_add_thread(protothread_fft) ;
+    pt_add_thread(protothread_blink) ;
     pt_schedule_start ;
+
+    while (1){
+        tight_loop_contents() ;
+    }
+    
 
 }
