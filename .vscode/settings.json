@@ -3,6 +3,8 @@
     "cortex-debug.variableUseNaturalFormat": false,
     "files.associations": {
         "vga_graphics.h": "c",
-        "spi.h": "c"
+        "spi.h": "c",
+        "stdlib.h": "c",
+        "adc.h": "c"
     }
 }
