@@ -20,7 +20,7 @@
 
  */
 
-/*------------------------Combined header files for FFT and DDS------------------------------------*/
+/*------------------------ Combined header files for FFT and DDS -------------------*/
 
 // Include VGA graphics library
 #include "vga_graphics.h"
@@ -62,11 +62,11 @@ typedef signed int fix15 ;
 // the DDS units - core 1
 // Phase accumulator and phase increment. Increment sets output frequency.
 volatile unsigned int phase_accum_main_1;                  
-volatile unsigned int phase_incr_main_1 = (2400.0*two32)/Fs_DDS ;
+volatile unsigned int phase_incr_main_1 = (2300.0*two32)/Fs_DDS ;
 // the DDS units - core 2
 // Phase accumulator and phase increment. Increment sets output frequency.
 volatile unsigned int phase_accum_main_0;
-volatile unsigned int phase_incr_main_0 = (2200.0*two32)/Fs_DDS ;
+volatile unsigned int phase_incr_main_0 = (2300.0*two32)/Fs_DDS ;
 
 // DDS sine table (populated in main())
 #define sine_table_size 256
@@ -82,23 +82,27 @@ fix15 attack_inc ;                      // rate at which sound ramps up
 fix15 decay_inc ;                       // rate at which sound ramps down
 fix15 current_amplitude_0 = 0 ;         // current amplitude (modified in ISR)
 fix15 current_amplitude_1 = 0 ;         // current amplitude (modified in ISR)
+fix15 scale_out = float2fix15(0.5) ;    // output scale factor (volume control)
 
 // Timing parameters for beeps (units of interrupts)
-#define ATTACK_TIME             200
-#define DECAY_TIME              200
-#define SUSTAIN_TIME            10000
-#define BEEP_DURATION           10400
-#define BEEP_REPEAT_INTERVAL    40000
+#define ATTACK_TIME             3000
+#define DECAY_TIME              3000
+#define SUSTAIN_TIME            (10000 - (ATTACK_TIME + DECAY_TIME))
+#define BEEP_DURATION           (ATTACK_TIME + SUSTAIN_TIME + DECAY_TIME)
+#define BEEP_REPEAT_INTERVAL    40000   // numeber of times per second the DACs are updated
+#define CHIRP_CYCLE_TIME        (BEEP_DURATION + BEEP_REPEAT_INTERVAL)
 
 // State machine variables
-volatile unsigned int STATE_0 = 0 ;
-volatile unsigned int count_0 = 0 ;
-volatile unsigned int STATE_1 = 0 ;
-volatile unsigned int count_1 = 0 ;
+volatile unsigned int STATE_L = 0 ;
+volatile unsigned int count_L = 0 ;
+#define chirp_L !(bool)STATE_L ;
+volatile unsigned int STATE_R = 0 ;
+volatile unsigned int count_R = 0 ;
+#define chirp_r !(bool)STATE_R ;
 
 // SPI data
-uint16_t DAC_data_1 ; // output value
-uint16_t DAC_data_0 ; // output value
+uint16_t DAC_data_L ; // output value
+uint16_t DAC_data_R ; // output value
 
 // DAC parameters (see the DAC datasheet)
 // A-channel, 1x, active
@@ -108,6 +112,7 @@ uint16_t DAC_data_0 ; // output value
 
 // Define the LED pin
 #define LED     25
+int blink_rate = 62500 ;    // 1/16th of a second
 
 //SPI configurations (note these represent GPIO number, NOT pin number)
 #define PIN_MISO 4
@@ -119,107 +124,60 @@ uint16_t DAC_data_0 ; // output value
 #define SPI_PORT spi0
 
 // Two variables to store core number
-volatile int corenum_0  ;
-volatile int corenum_1  ;
+volatile int corenum_0 ;
+volatile int corenum_1 ;
 
 // Global counter for spinlock experimenting
 volatile int global_counter = 0 ;
+// post-fft max frequency (set in protothread_fft, used in protothread_blink)
+volatile float fr_max = 0.0 ;
+// number of ffts per second
+volatile int FFT_count = 0 ;
 
 // Semaphore
 struct pt_sem core_1_go, core_0_go ;
 
-
-// This timer ISR is called on core 1
-bool repeating_timer_callback_core_1(struct repeating_timer *t) {
-
-    if (STATE_1 == 0) {
-        // DDS phase and sine table lookup
-        phase_accum_main_1 += phase_incr_main_1  ;
-        DAC_output_1 = fix2int15(multfix15(current_amplitude_1,
-            sin_table[phase_accum_main_1>>24])) + 2048 ;
-
-        // Ramp up amplitude
-        if (count_1 < ATTACK_TIME) {
-            current_amplitude_1 = (current_amplitude_1 + attack_inc) ;
-        }
-        // Ramp down amplitude
-        else if (count_1 > BEEP_DURATION - DECAY_TIME) {
-            current_amplitude_1 = (current_amplitude_1 - decay_inc) ;
-        }
-
-        // Mask with DAC control bits
-        DAC_data_1 = (DAC_config_chan_A | (DAC_output_1 & 0xffff))  ;
-
-        // SPI write (no spinlock b/c of SPI buffer)
-        spi_write16_blocking(SPI_PORT, &DAC_data_1, 1) ;
-
-        // Increment the counter
-        count_1 += 1 ;
-
-        // State transition?
-        if (count_1 == BEEP_DURATION) {
-            STATE_1 = 1 ;
-            count_1 = 0 ;
-        }
-    }
-
-    // State transition?
-    else {
-        count_1 += 1 ;
-        if (count_1 == BEEP_REPEAT_INTERVAL) {
-            current_amplitude_1 = 0 ;
-            STATE_1 = 0 ;
-            count_1 = 0 ;
-        }
-    }
-
-    // retrieve core number of execution
-    corenum_1 = get_core_num() ;
-
-    return true;
-}
-
 // This timer ISR is called on core 0
 bool repeating_timer_callback_core_0(struct repeating_timer *t) {
 
-    if (STATE_0 == 0) {
+    if (STATE_L == 0) {
         // DDS phase and sine table lookup
         phase_accum_main_0 += phase_incr_main_0  ;
-        DAC_output_0 = fix2int15(multfix15(current_amplitude_0,
+        DAC_output_0 = fix2int15(multfix15(multfix15(current_amplitude_0, scale_out),
             sin_table[phase_accum_main_0>>24])) + 2048 ;
 
         // Ramp up amplitude
-        if (count_0 < ATTACK_TIME) {
+        if (count_L < ATTACK_TIME) {
             current_amplitude_0 = (current_amplitude_0 + attack_inc) ;
         }
         // Ramp down amplitude
-        else if (count_0 > BEEP_DURATION - DECAY_TIME) {
+        else if (count_L > BEEP_DURATION - DECAY_TIME) {
             current_amplitude_0 = (current_amplitude_0 - decay_inc) ;
         }
 
         // Mask with DAC control bits
-        DAC_data_0 = (DAC_config_chan_B | (DAC_output_0 & 0xffff))  ;
+        DAC_data_L = (DAC_config_chan_B | (DAC_output_0 & 0xffff))  ;
 
         // SPI write (no spinlock b/c of SPI buffer)
-        spi_write16_blocking(SPI_PORT, &DAC_data_0, 1) ;
+        spi_write16_blocking(SPI_PORT, &DAC_data_L, 1) ;
 
         // Increment the counter
-        count_0 += 1 ;
+        count_L += 1 ;
 
         // State transition?
-        if (count_0 == BEEP_DURATION) {
-            STATE_0 = 1 ;
-            count_0 = 0 ;
+        if (count_L == BEEP_DURATION) {
+            STATE_L = 1 ;
+            count_L = 0 ;
         }
     }
 
     // State transition?
     else {
-        count_0 += 1 ;
-        if (count_0 == BEEP_REPEAT_INTERVAL) {
+        count_L += 1 ;
+        if (count_L == BEEP_REPEAT_INTERVAL) {
             current_amplitude_0 = 0 ;
-            STATE_0 = 0 ;
-            count_0 = 0 ;
+            STATE_L = 0 ;
+            count_L = 0 ;
         }
     }
 
@@ -229,7 +187,57 @@ bool repeating_timer_callback_core_0(struct repeating_timer *t) {
     return true;
 }
 
-// This thre3ad cab=n run on either core
+// This timer ISR is called on core 1
+bool repeating_timer_callback_core_1(struct repeating_timer *t) {
+
+    if (STATE_R == 0) {
+        // DDS phase and sine table lookup
+        phase_accum_main_1 += phase_incr_main_1  ;
+        DAC_output_1 = fix2int15(multfix15(multfix15(current_amplitude_1, scale_out),
+            sin_table[phase_accum_main_1>>24])) + 2048 ;
+
+        // Ramp up amplitude
+        if (count_R < ATTACK_TIME) {
+            current_amplitude_1 = (current_amplitude_1 + attack_inc) ;
+        }
+        // Ramp down amplitude
+        else if (count_R > BEEP_DURATION - DECAY_TIME) {
+            current_amplitude_1 = (current_amplitude_1 - decay_inc) ;
+        }
+
+        // Mask with DAC control bits
+        DAC_data_R = (DAC_config_chan_A | (DAC_output_1 & 0xffff))  ;
+
+        // SPI write (no spinlock b/c of SPI buffer)
+        spi_write16_blocking(SPI_PORT, &DAC_data_R, 1) ;
+
+        // Increment the counter
+        count_R += 1 ;
+
+        // State transition?
+        if (count_R == BEEP_DURATION) {
+            STATE_R = 1 ;
+            count_R = 0 ;
+        }
+    }
+
+    // State transition?
+    else {
+        count_R += 1 ;
+        if (count_R == BEEP_REPEAT_INTERVAL) {
+            current_amplitude_1 = 0 ;
+            STATE_R = 0 ;
+            count_R = 0 ;
+        }
+    }
+
+    // retrieve core number of execution
+    corenum_1 = get_core_num() ;
+
+    return true;
+}
+
+// This thread can run on either core
 static PT_THREAD (protothread_blink(struct pt *pt))
 {
     // Indicate beginning of thread
@@ -237,7 +245,7 @@ static PT_THREAD (protothread_blink(struct pt *pt))
     while (1) {
         // Toggle LED, then wait half a second
         gpio_put(LED, !gpio_get(LED)) ;
-        PT_YIELD_usec(250000) ;
+        PT_YIELD_usec(blink_rate) ;
     }
     PT_END(pt) ;
 }
@@ -259,9 +267,10 @@ static PT_THREAD (protothread_core_1(struct pt *pt))
         //    printf("Core 1: %d, ISR core: %d\n", global_counter, corenum_1) ;
         //}
         //printf("\n\n") ;
-        global_counter += 10 ;
-        printf("Core 1: %d, ISR core: %d\n", global_counter, corenum_1) ;
-        PT_YIELD_usec(10 * 250000) ;
+        global_counter++ ;
+        printf("Pong: Core 1: %d, ISR core: %d, Max F: % 5d, FFT count: %3d\n", global_counter, corenum_1, (int)fr_max, FFT_count) ;
+        FFT_count = 0;
+        PT_YIELD_usec(1000000) ;
         // signal other core
         PT_SEM_SAFE_SIGNAL(pt, &core_0_go) ;
     }
@@ -286,16 +295,16 @@ static PT_THREAD (protothread_core_0(struct pt *pt))
         //    printf("Core 0: %d, ISR core: %d\n", global_counter, corenum_0) ;
         //}
         //printf("\n\n") ;
-        global_counter += 10 ;
-        printf("Core 0: %d, ISR core: %d\n", global_counter, corenum_0) ;
-        PT_YIELD_usec(10 * 250000) ;
+        global_counter++ ;
+        printf("Ping: Core 0: %d, ISR core: %d, Max F: % 5d, FFT count: %3d\n", global_counter, corenum_0, (int)fr_max, FFT_count) ;
+        FFT_count = 0;
+        PT_YIELD_usec(1000000) ;
         // signal other core
         PT_SEM_SAFE_SIGNAL(pt, &core_1_go) ;
     }
     // Indicate thread end
     PT_END(pt) ;
 }
-
 
 // This is the core 1 entry point. Essentially main() for core 1
 void core1_entry_DDS() {
@@ -314,6 +323,7 @@ void core1_entry_DDS() {
 
     // Add thread to core 1
     pt_add_thread(protothread_core_1) ;
+    pt_add_thread(protothread_blink) ;
 
     // Start scheduler on core 1
     pt_schedule_start ;
@@ -334,7 +344,7 @@ void core1_entry_DDS() {
 // Log2 number of samples
 #define LOG2_NUM_SAMPLES 10
 // Sample rate (Hz)
-#define Fs 10000.0
+#define Fs_FFT 10000.0
 // ADC clock rate (unmutable!)
 #define ADCCLK 48000000.0
 
@@ -463,7 +473,7 @@ static PT_THREAD (protothread_fft(struct pt *pt))
 
     // Declare some static variables
     static int height ;             // for scaling display
-    static float max_freqency ;     // holds max frequency
+    static float max_frequency ;    // holds max frequency
     static int i ;                  // incrementing loop variable
 
     static fix15 max_fr ;           // temporary variable for max freq calculation
@@ -482,11 +492,10 @@ static PT_THREAD (protothread_fft(struct pt *pt))
     writeString("vha3@cornell.edu") ;
     setCursor(250, 0) ;
     setTextSize(2) ;
-    writeString("Max freqency:") ;
+    writeString("Max frequency:") ;
 
     // Will be used to write dynamic text to screen
     static char freqtext[40];
-
 
     while(1) {
         // Wait for NUM_SAMPLES samples to be gathered
@@ -508,6 +517,7 @@ static PT_THREAD (protothread_fft(struct pt *pt))
 
         // Compute the FFT
         FFTfix(fr, fi) ;
+        FFT_count++ ;
 
         // Find the magnitudes (alpha max plus beta min)
         for (int i = 0; i < (NUM_SAMPLES>>1); i++) {  
@@ -525,27 +535,28 @@ static PT_THREAD (protothread_fft(struct pt *pt))
             }
         }
         // Compute max frequency in Hz
-        max_freqency = max_fr_dex * (Fs/NUM_SAMPLES) ;
+        max_frequency = max_fr_dex * (Fs_FFT / NUM_SAMPLES) ;
+        fr_max = max_frequency;
 
         // Display on VGA
         fillRect(250, 20, 176, 30, BLACK); // red box
-        sprintf(freqtext, "%d", (int)max_freqency) ;
+        sprintf(freqtext, "% d", (int)max_frequency) ;
         setCursor(250, 20) ;
         setTextSize(2) ;
         writeString(freqtext) ;
 
         // Update the FFT display
-        for (int i=5; i<(NUM_SAMPLES>>1); i++) {
-            drawVLine(59+i, 50, 429, BLACK);
+        for (int i = 5; i < (NUM_SAMPLES >> 1); i++) {
+            drawVLine(59 + i, 50, 429, BLACK);
             height = fix2int15(multfix15(fr[i], int2fix15(36))) ;
-            drawVLine(59+i, 479-height, height, WHITE);
+            drawVLine(59 + i, 479 - height, height, WHITE);
         }
-
+        PT_YIELD_usec(10);
     }
     PT_END(pt) ;
 }
 
-/*------------------------Main Core 0 entry point for combination FFT and DDS------------------------------------*/
+/*------------------------ Main Core 0 entry point for combination FFT and DDS ------------------------------------*/
 
 // Core 0 entry point
 int main() {
@@ -648,7 +659,7 @@ int main() {
     // continuously) or > 95 (take samples less frequently than 96 cycle
     // intervals). This is all timed by the 48 MHz ADC clock. This is setup
     // to grab a sample at 10kHz (48Mhz/10kHz - 1)
-    adc_set_clkdiv(ADCCLK/Fs);
+    adc_set_clkdiv(ADCCLK/Fs_FFT);
 
 
     // Populate the sine table and Hann window table
@@ -698,7 +709,7 @@ int main() {
         false                               // Don't start immediately.
     );
 
-/*------------------------Launch for combined processes------------------------------------*/
+/*------------------------ Launch for combined processes ------------------------------------*/
 
     // Launch core 1
     multicore_launch_core1(core1_entry_DDS);
@@ -717,7 +728,7 @@ int main() {
 
     // Add core 0 threads
     pt_add_thread(protothread_core_0) ;
-    pt_add_thread(protothread_blink) ;
+    //pt_add_thread(protothread_blink) ;
     pt_add_thread(protothread_fft) ;
 
     // Start scheduling core 0 threads
